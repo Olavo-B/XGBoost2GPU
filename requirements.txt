@@ -1,4 +1,13 @@
-numpy>=2.3.0
-setuptools>=80.9.0
-treelut @ git+https://github.com/Olavo-B/TreeLUT.git
-loadDataset @ git+https://github.com/Olavo-B/LoadDataset
+# Additional dependencies beyond the core ones in setup.py
+# Development and optional dependencies
+setuptools>=45.0.0
+
+# Optional dependencies for TreeLUT (external packages)
+# Uncomment these if you have access to the repositories:
+# treelut @ git+https://github.com/Olavo-B/TreeLUT.git
+# LoadDataset @ git+https://github.com/Olavo-B/LoadDataset.git
+
+# Additional useful packages for development
+jupyter>=1.0.0
+plotly>=5.0.0
+seaborn>=0.11.0

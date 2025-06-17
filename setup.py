@@ -77,7 +77,7 @@ setup(
         "matplotlib>=3.4.0",
         "xgboost>=1.4.0",
         "scikit-learn>=1.0.0",
-    ],
+    ] + get_requirements(),
     extras_require={
         "dev": [
             "pytest>=6.2.0",
