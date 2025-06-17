@@ -1,3 +1,4 @@
 numpy>=2.3.0
 setuptools>=80.9.0
-treelut>=1.0.2
+treelut @ git+https://github.com/Olavo-B/TreeLUT.git
+loadDataset @ git+https://github.com/Olavo-B/LoadDataset
