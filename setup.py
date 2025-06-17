@@ -79,7 +79,7 @@ setup(
         "scikit-learn>=1.0.0",
         "treelut @ git+https://github.com/Olavo-B/TreeLUT.git",
         "LoadDataset @ git+https://github.com/Olavo-B/LoadDataset.git"
-    ]
+    ],
     extras_require={
         "dev": [
             "pytest>=6.2.0",
