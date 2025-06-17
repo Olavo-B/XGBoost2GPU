@@ -2,10 +2,9 @@
 # Development and optional dependencies
 setuptools>=45.0.0
 
-# Optional dependencies for TreeLUT (external packages)
-# Uncomment these if you have access to the repositories:
-# treelut @ git+https://github.com/Olavo-B/TreeLUT.git
-# LoadDataset @ git+https://github.com/Olavo-B/LoadDataset.git
+
+treelut @ git+https://github.com/Olavo-B/TreeLUT.git
+LoadDataset @ git+https://github.com/Olavo-B/LoadDataset.git
 
 # Additional useful packages for development
 jupyter>=1.0.0
