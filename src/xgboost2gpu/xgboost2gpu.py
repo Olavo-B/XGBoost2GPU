@@ -20,28 +20,32 @@ from treelut import TreeLUTClassifier
 from .treePruningHash import TreePruningHash
 
 class XGBoost2GPU:
-    def __init__(self, treelut_model: TreeLUTClassifier, 
+    def __init__(self, treelut_model: TreeLUTClassifier,
                  w_feature: int = 3,
                  w_tree: int = 3,
                  n_samples: int = 1000,
                  n_threads: int = 256,
                  n_blocks: int = 768
                  ):
-        self._model          = treelut_model
-        self._w_feature      = w_feature
-        self._w_tree         = w_tree
-        self._n_samples      = n_samples
+        self._model             = treelut_model
+        self._w_feature         = w_feature
+        self._w_tree            = w_tree
+        self._n_samples         = n_samples
 
-        self._n_threads      = n_threads
-        self._n_blocks       = n_blocks
+        self._n_threads         = n_threads
+        self._n_blocks          = n_blocks
 
-        self._n_classes      = treelut_model.n_classes
-        self._trees          = treelut_model.trees
-        self._bias           = treelut_model.classes_bias
-        self._min, self._max = treelut_model.min, treelut_model.max
+        self._n_classes         = treelut_model.n_classes
+        self._trees             = treelut_model.trees
+        self._bias              = treelut_model.classes_bias
+        self._min, self._max    = treelut_model.min, treelut_model.max
 
 
-        self._prune = None  # Placeholder for prune vector, to be set later
+        self._code_gen          = False  # Flag to indicate if code has been generated
+        self._prune             = None  # Placeholder for prune vector, to be set later
+        self._trees_array       = None  # Placeholder for the trees converted to NumPy arrays
+        self._tree_root_indices = None  # Placeholder for root indices of trees
+
 
 
 
@@ -74,6 +78,10 @@ class XGBoost2GPU:
         code = self._header_code()
         code += self._kernel_code()
         code += self._main_code()
+
+        self._convert_trees_to_numpy()  # Convert trees to NumPy arrays for efficient processing
+        self._code_gen = True
+
         with open(output_file, 'w') as f:
             f.write(code)
         print(f"CUDA code generated and saved to {output_file}")
@@ -124,6 +132,16 @@ class XGBoost2GPU:
             sorted_tree = dict(sorted(tree.items()))
             for node_id , node in sorted_tree.items():
 
+                # 2025-06-17 17:22:13
+                # If node is a leaf, the probability is 1.0 (no cut)
+                if node['type'] == 'leaf':
+                    probabilities[node['global_id']] = 0.0
+                    continue
+                
+                # If the node is the root, we do not cut it
+                if node_id == 0:
+                    probabilities[node['global_id']] = 0.0
+                    continue
                 # Calculate probability for current node
                 prob = self._calculate_cut_probability(
                     node_level=node_levels[node_id],
@@ -149,8 +167,8 @@ class XGBoost2GPU:
                 decision = self._simulate_cut_decision(pruner, prob, global_id)
                 if decision:
                     # Node should be cut
-                    nodes_cut_so_far += 1
-                    nodes_cut_in_tree += 1
+                    nodes_cut_so_far += self._consequence_nodes(node_levels[node_id])
+                    nodes_cut_in_tree += self._consequence_nodes(node_levels[node_id])
             
             nodes_processed_so_far += 1  # Update processed nodes
 
@@ -159,8 +177,8 @@ class XGBoost2GPU:
             for node_id, prob in probabilities.items():
                 f.write(f"{prob}\n")
 
-        self._prune = probabilities  # Store probabilities for later use
-         
+        self._prune = np.array(list(probabilities.values()))  # Store probabilities for later use
+
     def should_cut_node(self, thread_id: int, node_id: int) -> int:
         """Determine if a node should be cut based on its ID and a cut probability.
         Args:
@@ -174,6 +192,25 @@ class XGBoost2GPU:
         cut_probability = self._prune[node_id] if node_id < len(self._prune) else 0.0
         pruner = TreePruningHash()
         return pruner.should_cut_node(thread_id, cut_probability, node_id)
+
+    def should_cut_nodes(self, thread_id: int, global_ids: np.ndarray) -> np.ndarray:
+        """
+        Determine if a set of nodes should be cut. This vectorized version
+        is used by the predict method for high performance.
+
+        Args:
+            thread_id (int): The unique identifier for the thread.
+            global_ids (np.ndarray): An array of unique identifiers for the nodes.
+
+        Returns:
+            np.ndarray: An array of integers (1 for cut, 0 for keep).
+        """
+        if not hasattr(self, '_prune') or self._prune is None:
+            raise ValueError("Prune vector is not set.")
+
+        cut_probabilities = self._prune
+        pruner = TreePruningHash()
+        return pruner.should_cut_nodes_vectorized(thread_id, cut_probabilities, global_ids )
 
     def prune_matrix(self,num_threads:int, save_matrix:bool = False) -> np.ndarray:
         """Generate a matrix of cut probabilities for all nodes in the forest.
@@ -194,15 +231,198 @@ class XGBoost2GPU:
             
         if save_matrix:
             # Save the matrix to a file
-            np.savetxt('prune_matrix.csv', prune_matrix, delimiter=',', fmt='%d')
-            print("Prune matrix saved to 'prune_matrix.csv'.")
+            np.savetxt('results/prune_matrix.csv', prune_matrix, delimiter=',', fmt='%d')
+            print("Prune matrix saved to 'results/prune_matrix.csv'.")
 
         return prune_matrix
+    
+    def predict(self, X: np.ndarray, thread_id: int = 0) -> np.ndarray:
+        """
+        Predict the class labels for the input data using the pruned trees.
+        This implementation is vectorized with NumPy and calls the vectorized
+        pruning function for high performance.
+
+        Args:
+            X (np.ndarray): Input data of shape (n_samples, n_features).
+            thread_id (int): The thread ID to use for pruning decisions.
+
+        Returns:
+            np.ndarray: Predicted class labels.
+        """
+        # Ensure the prune vector and tree arrays are available.
+        if not hasattr(self, '_prune') or self._prune is None:
+            raise ValueError("Prune vector is not set. Please calculate cut probabilities first.")
+        if not hasattr(self, '_trees_array') or self._trees_array is None:
+            raise RuntimeError("Tree data structure not prepared. Please run _convert_trees_to_numpy() after training.")
+
+        n_samples = X.shape[0]
+        X_quantized = self._quantize_node(X)
+        
+        # Initialize predictions with class bias
+        predictions_agg = np.zeros((n_samples, self._n_classes), dtype=np.float64)
+        
+        # Initialize with class bias if available
+        if hasattr(self, '_bias') and self._bias is not None:
+            for class_idx in range(self._n_classes):
+                predictions_agg[:, class_idx] = self._bias[class_idx]
+        
+        # --- Constants for property indices ---
+        FEAT_IDX, THRESH_IDX, LEFT_IDX, RIGHT_IDX, VAL_IDX, GID_IDX, IS_LEAF_IDX = 0, 1, 2, 3, 4, 5, 6
+
+        global_ids = self._trees_array[:, GID_IDX].astype(np.int32)
+                
+        # Call the fully vectorized pruning function for maximum performance.
+        # # For debugging, assume all prune_flags are False
+        # prune_flags = np.zeros(len(global_ids), dtype=bool)  # All False for testing
+        # Uncomment this line when ready to use actual pruning:
+        prune_flags = self.should_cut_nodes(thread_id, global_ids).astype(bool)
+
+        print(f"Info: Pruning {np.sum(prune_flags)} nodes out of {len(prune_flags)} total nodes.")
+
+        # The main prediction loop iterates over each tree in the ensemble.
+        for i, root_node_idx in enumerate(self._tree_root_indices):
+            class_idx = i % self._n_classes
+            
+            # Verificação de bounds para segurança
+            if root_node_idx >= len(self._trees_array):
+                print(f"Warning: Root node {root_node_idx} out of bounds for tree {i}")
+                continue
+            
+            node_indices = np.full(n_samples, root_node_idx, dtype=np.int32)
+            active_mask = np.ones(n_samples, dtype=bool)
+
+            iteration = 0
+            while np.any(active_mask) and iteration < 100:  # Safety limit
+                iteration += 1
+                active_indices = node_indices[active_mask]
+                
+                # Verificação de bounds
+                if np.any(active_indices >= len(self._trees_array)) or np.any(active_indices < 0):
+                    print(f"Error: Invalid node indices in tree {i}, iteration {iteration}")
+                    break
+                
+                nodes = self._trees_array[active_indices]
+
+                global_ids = nodes[:, GID_IDX].astype(np.int32)
+                leaf_flags = nodes[:, IS_LEAF_IDX] == 1
+                
+                # Since prune_flags is all False, is_finished = leaf_flags
+                is_finished = prune_flags[global_ids] | leaf_flags
+                
+                if np.any(is_finished):
+                    finished_indices = active_indices[is_finished]
+                    finished_values = self._trees_array[finished_indices, VAL_IDX]
+                    
+                    # Correct indexing: get the actual sample indices that are finished
+                    active_sample_indices = np.where(active_mask)[0]
+                    finished_sample_indices = active_sample_indices[is_finished]
+                    
+                    # Add the leaf values to the predictions
+                    predictions_agg[finished_sample_indices, class_idx] += finished_values
+                    
+                    # Update active mask
+                    active_mask[active_mask] = ~is_finished
+                    
+                    if not np.any(active_mask):
+                        break
+
+                # Continue navigation for non-leaf nodes
+                if np.any(active_mask):
+                    continuing_nodes = self._trees_array[node_indices[active_mask]]
+                    
+                    features = continuing_nodes[:, FEAT_IDX].astype(np.int32)
+                    thresholds = continuing_nodes[:, THRESH_IDX]
+                    
+                    # Verificação de bounds para features
+                    if np.any(features >= X_quantized.shape[1]) or np.any(features < 0):
+                        print(f"Error: Invalid feature indices in tree {i}")
+                        break
+                    
+                    # Get feature values for active samples
+                    active_sample_indices = np.where(active_mask)[0]
+                    sample_features = X_quantized[active_sample_indices, features]
+                    left_path_mask = sample_features < thresholds
+                    
+                    next_nodes = np.where(
+                        left_path_mask,
+                        continuing_nodes[:, LEFT_IDX],
+                        continuing_nodes[:, RIGHT_IDX]
+                    ).astype(np.int32)
+                    
+                    node_indices[active_mask] = next_nodes
+            
+            if iteration >= 100:
+                print(f"Warning: Tree {i} hit iteration limit!")
+        
+        # Debug info
+        print(f"Final predictions_agg stats per class:")
+        for c in range(self._n_classes):
+            print(f"  Class {c}: min={np.min(predictions_agg[:, c]):.3f}, "
+                f"max={np.max(predictions_agg[:, c]):.3f}, "
+                f"mean={np.mean(predictions_agg[:, c]):.3f}")
+        
+        return np.argmax(predictions_agg, axis=1)
+
     #====================#
     # Private Methods   #
     #====================#
+    def _convert_trees_to_numpy(self):
+        """
+        Converts the list of dictionary-based trees into flat NumPy arrays
+        for efficient processing. This is a one-time operation that should be
+        called after training is complete.
+        """
+        if not hasattr(self, '_trees') or not self._trees:
+            self._trees_array = None
+            self._tree_root_indices = None
+            return
 
-    def _quantize(self, tree) -> None:
+        node_list = []
+        tree_root_indices = []
+        
+        # --- Constants for property indices ---
+        FEAT_IDX, THRESH_IDX, LEFT_IDX, RIGHT_IDX, VAL_IDX, GID_IDX, IS_LEAF_IDX = 0, 1, 2, 3, 4, 5, 6
+        
+        current_node_offset = 0
+        for tree in self._trees:
+            tree_root_indices.append(current_node_offset)
+            
+            node_id_map = {node_id: i + current_node_offset for i, node_id in enumerate(tree.keys())}
+            
+            for node_id, node in tree.items():
+                if node['type'] == 'leaf':
+                    node_data = [-1, -1, -1, -1, node['value'], node['global_id'], 1]
+                else:
+                    node_data = [
+                        node['feature'], node['threshold'],
+                        node_id_map[node['yes']], node_id_map[node['no']],
+                        node['value'], node['global_id'], 0
+                    ]
+                node_list.append(node_data)
+            
+            current_node_offset += len(tree)
+
+        self._trees_array = np.array(node_list, dtype=np.float64)
+        self._tree_root_indices = np.array(tree_root_indices, dtype=np.int32)
+
+        # Save as a csv file for debugging purposes
+        if not os.path.exists('results'):
+            os.makedirs('results')
+        np.savetxt('results/trees_array.csv', self._trees_array, delimiter=',', fmt='%.6f')
+
+    def _quantize_node(self, X) -> int:
+        """Quantize based on min_max scaling the values of each feature and
+        but it under the w_feature max bits.
+        """
+
+        from sklearn.preprocessing import MinMaxScaler
+
+        scaler = MinMaxScaler()
+        X_train_min_max = np.round(scaler.fit_transform(X) * (2**self._w_feature - 1))
+
+        return X_train_min_max
+
+    def _quantize_leafs(self, tree) -> None:
         """
         Quantize using min_max scaling the values of each node and but it under the
         w_tree max bits.
@@ -279,7 +499,7 @@ class XGBoost2GPU:
             level_bias: base multiplier to give more weight to level (1.0+)
 
         Returns:
-            probability between 0.0 and 1.0, beeing 0.0 the node will be cut and 1.0 the node will not be cut.
+            probability between 0.0 and 1.0, beeing 1.0 the node will be cut and 0.0 the node will not be cut.
         """
         # --- Soft Per-Tree Limit Logic ---
         max_nodes_in_tree = int(nodes_in_tree * max_cut_percentage)
@@ -369,6 +589,56 @@ class XGBoost2GPU:
         # Count votes and return the majority decision
         counts = collections.Counter(decisions)
         return counts.most_common(1)[0][0]
+
+    def _get_threshold(self, X_min, X_max) -> np.ndarray:
+        """
+        Calculate the threshold for the quantization module based on the minimum and maximum values of the features.
+        The threshold is calculated as the (2**w-feature)-1 midpoints between the minimum and maximum values.
+        """
+
+        thresholds = np.zeros( 2**self._w_feature - 1)
+
+        min_val = X_min
+        max_val = X_max
+        if min_val == max_val - 1:
+            # If min and max are one scale apart, set all thresholds to -1
+            # This indicates that the feature is constant and does not need quantization.
+            thresholds[:] = -1
+        else: 
+            step = int((max_val - min_val) / (2**self._w_feature - 1))
+            thresholds[0] = int(min_val + step / 2)
+            for j in range(1, 2**self._w_feature - 1):
+                thresholds[j] = thresholds[j-1] + step
+        # print(f"Info: Thresholds for quantization module: {thresholds}")
+        return thresholds
+   
+    def _consequence_nodes(self, level: int) -> int:
+        """Calculate the number of nodes that will be pruned as consequence
+        of pruning a node at a given level in the tree.
+
+
+        0 -> root node, no nodes will be pruned
+        1 -> level 1, 2 nodes will be pruned
+        2 -> level 2, 4 nodes will be pruned
+        .
+        .
+        max_level -> 2**max_level nodes will be pruned
+        
+        Args:
+            level (int): The level of the node in the tree.
+        
+        Returns:
+            int: The number of nodes that will be pruned.
+        """
+        
+        if level < 0:
+            raise ValueError("Level must be a non-negative integer.")
+        if level == 0:
+            return 0  # Root node, no nodes will be pruned
+        return 2 ** (self._model.max_depth - level) + 1 # Each level doubles the number of nodes in a binary tree
+
+   
+    #====================#
     # Code Gen Methods   #
     #====================#
 
@@ -406,7 +676,7 @@ class XGBoost2GPU:
         """
         
         self._get_mean(tree, 0)  # Calculate means for the tree
-        self._quantize(tree)
+        self._quantize_leafs(tree)
         
         # Calcula o offset baseado no id da árvore atual
         nodes_offset = sum(self._model.nodes()[:id]) if id > 0 else 0
@@ -483,34 +753,11 @@ class XGBoost2GPU:
             str: The generated CUDA code for the quantization operation.
         """
 
-    
-
-
-        def _get_threashold( X_min, X_max) -> np.ndarray:
-            """
-            Calculate the threshold for the quantization module based on the minimum and maximum values of the features.
-            The threshold is calculated as the (2**w-feature)-1 midpoints between the minimum and maximum values.
-            """
-
-            thresholds = np.zeros( 2**self._w_feature - 1)
-        
-            min_val = X_min
-            max_val = X_max
-            if min_val == max_val - 1:
-                # If min and max are one scale apart, set all thresholds to -1
-                # This indicates that the feature is constant and does not need quantization.
-                thresholds[:] = -1
-            else: 
-                step = int((max_val - min_val) / (2**self._w_feature - 1))
-                thresholds[0] = int(min_val + step / 2)
-                for j in range(1, 2**self._w_feature - 1):
-                    thresholds[j] = thresholds[j-1] + step
-        # print(f"Info: Thresholds for quantization module: {thresholds}")
-            return thresholds
+ 
         
         code = "__device__ void quantize(int* arr, int size) {\n"
         for i in range(len(self._min)):
-            threshold = _get_threashold(self._min[i], self._max[i]) # Getting threshold for feature i
+            threshold = self._get_threshold(self._min[i], self._max[i]) # Getting threshold for feature i
             if threshold[0] == -1:
                 # If the feature is constant, set it to 0
                 code += f"    arr[{i}] = arr[{i}];\n"
