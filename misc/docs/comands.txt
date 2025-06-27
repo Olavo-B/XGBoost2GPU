@@ -1,0 +1,5 @@
+# Load Sus dataset
+susy = pd.read_csv('../data/SUSY_int.csv')
+data = susy.drop(columns=['target'])
+target = susy['target'].astype('int')
+    
