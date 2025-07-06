@@ -18,7 +18,8 @@ XGBoost2GPU transforms your trained XGBoost models into highly optimized CUDA co
 
 ##  Installation
 
->  **Warning**: This library requires NVIDIA GPU with CUDA support and TreeLUT dependencies.
+> [!WARNING]
+>  This library requires NVIDIA GPU with CUDA support and TreeLUT dependencies.
 
 ### Prerequisites
 
@@ -54,7 +55,8 @@ pip install -e ".[all]"
 pip install -e ".[dev]"
 ```
 
->  **Note**: TreeLUT and LoadDataset are automatically installed from GitHub repositories.
+> [!NOTE]
+> TreeLUT and LoadDataset are automatically installed from GitHub repositories.
 
 ##  Quick Start
 
@@ -105,7 +107,8 @@ print("✅ CUDA code generated successfully!")
 
 ### Complete Workflow Example
 
->  **Info**: Check out the [complete Jupyter notebook example](misc/example/xgboost2gpu_example.ipynb) for a full workflow demonstration.
+> [!TIP]
+> Check out the [complete Jupyter notebook example](misc/example/xgboost2gpu_example.ipynb) for a full workflow demonstration.
 
 
 ### Compilation and Execution
