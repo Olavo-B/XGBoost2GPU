@@ -25,7 +25,8 @@ class XGBoost2GPU:
                  w_tree: int = 3,
                  n_samples: int = 1000,
                  n_threads: int = 256,
-                 n_blocks: int = 768
+                 n_blocks: int = 768,
+                 debug: bool = False
                  ):
         self._model             = treelut_model
         self._w_feature         = w_feature
@@ -34,6 +35,7 @@ class XGBoost2GPU:
 
         self._n_threads         = n_threads
         self._n_blocks          = n_blocks
+        self._debug             = debug
 
         self._n_classes         = treelut_model.n_classes
         self._trees             = treelut_model.trees
@@ -67,7 +69,7 @@ class XGBoost2GPU:
     # Public Methods    #
     #===================#
 
-    def generate_cuda_code(self, output_file: str):
+    def generate_cuda_code(self, output_file: str, optimization: bool = True):
         
         """Generate the CUDA code for the XGBoost model and save it to a file.
         Args:
@@ -76,8 +78,10 @@ class XGBoost2GPU:
         if not output_file.endswith('.cu'):
             raise ValueError("Output file must have a .cu extension.")
         code = self._header_code()
-        code += self._kernel_code()
-        code += self._main_code()
+        code += self._kernel_code() if not optimization else self._optimized_kernel_code()
+        code += self._main_code() if not optimization else self._optimized_main_code()
+
+    
 
         self._convert_trees_to_numpy()  # Convert trees to NumPy arrays for efficient processing
         self._code_gen = True
@@ -117,6 +121,12 @@ class XGBoost2GPU:
         total_nodes_in_forest = sum(self._model.nodes())
         total_nodes_to_cut = int(total_nodes_in_forest * percentage_to_cut)
 
+        # 2025-07-01 13:42:58
+        # Remove leafs and roots from the total nodes to cut
+        total_nodes_in_forest -= sum(1 for tree in self._trees for node in tree.values() if node['type'] == 'leaf')
+        total_nodes_in_forest -= sum(1 for tree in self._trees for node in tree.keys() if node == 0)  # Remove roots
+
+
         nodes_cut_so_far = 0
         nodes_processed_so_far = 0
 
@@ -125,12 +135,11 @@ class XGBoost2GPU:
         # Initialize hash function for consistent decisions
         pruner = TreePruningHash()
 
-        for tree in self._trees:
+        for tree_index, tree in enumerate(self._trees):
             nodes_in_tree = len(tree)
             nodes_cut_in_tree = 0
             node_levels = self._get_node_levels(tree)
-            sorted_tree = dict(sorted(tree.items()))
-            for node_id , node in sorted_tree.items():
+            for node_id , node in tree.items():
 
                 # 2025-06-17 17:22:13
                 # If node is a leaf, the probability is 1.0 (no cut)
@@ -143,6 +152,8 @@ class XGBoost2GPU:
                     probabilities[node['global_id']] = 0.0
                     continue
                 # Calculate probability for current node
+                if self._debug:
+                    print(f"Calculating cut probability for node {node_id} at level {node_levels[node_id]} in tree {tree_index} with global ID {node['global_id']}")
                 prob = self._calculate_cut_probability(
                     node_level=node_levels[node_id],
                     nodes_cut_so_far=nodes_cut_so_far,
@@ -163,14 +174,14 @@ class XGBoost2GPU:
                 probabilities[global_id] = prob
             
                 # 2025-06-16 14:26:34
-                # Simulate cutting decision with 100 random threads id
+                # Simulate cutting decision with 10000 random threads id
                 decision = self._simulate_cut_decision(pruner, prob, global_id)
                 if decision:
                     # Node should be cut
                     nodes_cut_so_far += self._consequence_nodes(node_levels[node_id])
                     nodes_cut_in_tree += self._consequence_nodes(node_levels[node_id])
             
-            nodes_processed_so_far += 1  # Update processed nodes
+                nodes_processed_so_far += 1  # Update processed nodes
 
         # Save probabilities in a .csv file
         with open(output_file, 'w') as f:
@@ -193,46 +204,85 @@ class XGBoost2GPU:
         pruner = TreePruningHash()
         return pruner.should_cut_node(thread_id, cut_probability, node_id)
 
-    def should_cut_nodes(self, thread_id: int, global_ids: np.ndarray) -> np.ndarray:
+    def should_cut_nodes(self, thread_id: int) -> np.ndarray:
         """
         Determine if a set of nodes should be cut. This vectorized version
         is used by the predict method for high performance.
 
         Args:
             thread_id (int): The unique identifier for the thread.
-            global_ids (np.ndarray): An array of unique identifiers for the nodes.
 
         Returns:
             np.ndarray: An array of integers (1 for cut, 0 for keep).
         """
         if not hasattr(self, '_prune') or self._prune is None:
             raise ValueError("Prune vector is not set.")
+        if not hasattr(self, '_trees_array') or self._trees_array is None:
+            raise RuntimeError("Tree data structure not prepared. Please run generate_cuda_code() after training.")
+
+        GID_IDX = 5
 
         cut_probabilities = self._prune
+        global_ids = self._trees_array[:, GID_IDX].astype(np.int32)
         pruner = TreePruningHash()
-        return pruner.should_cut_nodes_vectorized(thread_id, cut_probabilities, global_ids )
 
-    def prune_matrix(self,num_threads:int, save_matrix:bool = False) -> np.ndarray:
-        """Generate a matrix of cut probabilities for all nodes in the forest.
+        return pruner.should_cut_nodes_vectorized(thread_id, cut_probabilities, global_ids)
+
+    def prune_matrix(self, num_threads: int = None, save_matrix: bool = False) -> np.ndarray:
+        """
+        Generates a bitmask matrix for the pruning decisions on all nodes in the forest.
+
         Args:
-            num_threads (int): The number of threads to use for pruning.
+            num_threads (int): The number of threads to use for the pruning simulation.
+            save_matrix (bool): If true, saves the resulting matrix to a CSV file.
+
         Returns:
-            np.ndarray: A 2D array where each row corresponds to a tree and each column to a node.
+            np.ndarray: A 2D array where each row corresponds to a thread and each column is a
+                        uint32 integer that packs 32 node pruning decisions as bits.
         """
         if self._prune is None:
             raise ValueError("Prune vector is not set. Please calculate cut probabilities first.")
+        if self._trees_array is None:
+            raise RuntimeError("Tree data structure not prepared. Please run generate_cuda_code() after training.")
         
-        # Create a matrix with shape (n_trees, max_nodes_per_tree)
-        prune_matrix = np.zeros(shape=(num_threads, len(self._prune)), dtype=bool)
+        if num_threads is None:
+            num_threads = self._n_threads * self._n_blocks  # Default to total threads available
 
-        for node_id in range(len(self._prune)):
-            for thread_id in range(num_threads):
-                prune_matrix[thread_id, node_id] = self.should_cut_node(thread_id, node_id)
-            
+        num_nodes = len(self._prune)
+        bits_per_int = np.iinfo(np.uint32).bits
+
+        # Calculate the number of uint32 columns needed to cover all nodes
+        num_packed_cols = math.ceil(num_nodes / bits_per_int)
+
+        prune_matrix = np.zeros(shape=(num_threads, num_packed_cols), dtype=np.uint32)
+
+
+        for thread_id in range(num_threads):
+            # This function call remains the same
+            should_cut_arr = self.should_cut_nodes(thread_id)
+
+            # 1. Find the indices of the nodes to be cut (where the value is True)
+            cut_indices = np.where(should_cut_arr)[0]
+
+            # Only proceed if there are nodes to cut
+            if cut_indices.size > 0:
+                # 2. Calculate the column index in the packed matrix for each cut
+                packed_col_indices = cut_indices // bits_per_int
+
+                # 3. Calculate the bit position (0 to 31) for each cut
+                bit_positions = cut_indices % bits_per_int
+
+                # 4. Create the bitmasks (e.g., 1 << 0, 1 << 5, etc.)
+                bitmasks = np.left_shift(np.uint32(1), bit_positions)
+
+                # 5. Use np.bitwise_or.at to apply the masks efficiently.
+                np.bitwise_or.at(prune_matrix[thread_id], packed_col_indices, bitmasks)
         if save_matrix:
-            # Save the matrix to a file
+            if not os.path.exists('results'):
+                os.makedirs('results')
+            
             np.savetxt('results/prune_matrix.csv', prune_matrix, delimiter=',', fmt='%d')
-            print("Prune matrix saved to 'results/prune_matrix.csv'.")
+
 
         return prune_matrix
     
@@ -268,16 +318,12 @@ class XGBoost2GPU:
         
         # --- Constants for property indices ---
         FEAT_IDX, THRESH_IDX, LEFT_IDX, RIGHT_IDX, VAL_IDX, GID_IDX, IS_LEAF_IDX = 0, 1, 2, 3, 4, 5, 6
-
-        global_ids = self._trees_array[:, GID_IDX].astype(np.int32)
                 
         # Call the fully vectorized pruning function for maximum performance.
         # # For debugging, assume all prune_flags are False
         # prune_flags = np.zeros(len(global_ids), dtype=bool)  # All False for testing
         # Uncomment this line when ready to use actual pruning:
-        prune_flags = self.should_cut_nodes(thread_id, global_ids).astype(bool)
-
-        print(f"Info: Pruning {np.sum(prune_flags)} nodes out of {len(prune_flags)} total nodes.")
+        prune_flags = self.should_cut_nodes(thread_id).astype(bool)
 
         # The main prediction loop iterates over each tree in the ensemble.
         for i, root_node_idx in enumerate(self._tree_root_indices):
@@ -355,11 +401,11 @@ class XGBoost2GPU:
                 print(f"Warning: Tree {i} hit iteration limit!")
         
         # Debug info
-        print(f"Final predictions_agg stats per class:")
-        for c in range(self._n_classes):
-            print(f"  Class {c}: min={np.min(predictions_agg[:, c]):.3f}, "
-                f"max={np.max(predictions_agg[:, c]):.3f}, "
-                f"mean={np.mean(predictions_agg[:, c]):.3f}")
+        # print(f"Final predictions_agg stats per class:")
+        # for c in range(self._n_classes):
+        #     print(f"  Class {c}: min={np.min(predictions_agg[:, c]):.3f}, "
+        #         f"max={np.max(predictions_agg[:, c]):.3f}, "
+        #         f"mean={np.mean(predictions_agg[:, c]):.3f}")
         
         return np.argmax(predictions_agg, axis=1)
 
@@ -508,11 +554,24 @@ class XGBoost2GPU:
         remaining_to_process = total_nodes_in_forest - nodes_processed_so_far
         remaining_to_cut = total_nodes_to_cut - nodes_cut_so_far
 
+        urgency_ratio = remaining_to_cut / remaining_to_process
+
         if remaining_to_process > 0:
-            urgency_ratio = remaining_to_cut / remaining_to_process
             is_desperate = urgency_ratio > ((total_nodes_to_cut / total_nodes_in_forest) * urgency_override_threshold)
             if is_tree_limit_reached and not is_desperate:
                 return 0.0 # Respect the limit, as we are not desperate
+
+        if self._debug:
+            print(f"  Status:")
+            print(f"    · Nodes cut so far: {nodes_cut_so_far}")
+            print(f"    · Total nodes to cut: {total_nodes_to_cut}")
+            print(f"    · Nodes processed so far: {nodes_processed_so_far}")
+            print(f"    · Total nodes in forest: {total_nodes_in_forest}")
+            print(f"    · Nodes cut in current tree: {nodes_cut_in_tree}")
+            print(f"    · Remaining to process: {remaining_to_process}")
+            print(f"    · Remaining to cut: {remaining_to_cut}")
+            print(f"    · Max nodes in tree: {max_nodes_in_tree}")
+            print(f"    · Is tree limit reached: {is_tree_limit_reached}")
 
         if remaining_to_cut <= 0:
             return 0.0 # Goal reached
@@ -529,12 +588,21 @@ class XGBoost2GPU:
         elif strategy == "exponential":
             level_factor = level_bias * ((1 + level_importance) ** node_level)
         elif strategy == "adaptive":
-            level_factor = level_bias + (node_level * level_importance)
+            level_factor_temp = level_bias + (node_level * level_importance)
+            level_factor = level_factor_temp if level_factor_temp > 0 else 1  # 2025-07-01 20:32:18::Avoid always zero final_prob
             progress_ratio = nodes_cut_so_far / total_nodes_to_cut if total_nodes_to_cut > 0 else 0
-            urgency_factor = 1.0 + (0.5 - progress_ratio) * progress_importance
+            urgency_factor = (1.0 + (0.5 - progress_ratio)) * (1.0 + progress_importance)
             urgency_factor = max(0.1, urgency_factor)
+
         elif strategy == "random":
             return random.uniform(0.0, 1.0)  # Random probability for testing
+        
+
+        if self._debug:
+            print(f"    » Level Factor: {level_factor:.4f}")
+            print(f"    » Urgency Factor: {urgency_factor:.4f}")
+            print(f"    » Base Probability: {base_prob:.4f}")
+            
 
         final_prob = base_prob * level_factor * urgency_factor
         return min(1.0, max(0.0, final_prob))
@@ -582,7 +650,7 @@ class XGBoost2GPU:
         
         decisions = []
         # Simulate with 1000 different thread IDs for robustness
-        for thread_id in range(1000):
+        for thread_id in range(10000):
             decision = pruner.should_cut_node(id=thread_id, cut_probability=prob, salt=global_id)
             decisions.append(decision)
         
@@ -699,8 +767,8 @@ class XGBoost2GPU:
                 code += f"      node_{global_id} = {node['value']};\n"
         
         return code
-    
-    def _forest_code(self) -> str:
+
+    def _forest_code(self, optimization: bool = False) -> str:
         """Generate CUDA code for the entire forest.
         Returns:
             str: The generated CUDA code for the forest.
@@ -709,7 +777,7 @@ class XGBoost2GPU:
         code = ""
         for i, tree in enumerate(self._trees):
             code += f"// Tree {i}\n"
-            code += self._tree_code(tree, i, len(self._trees))
+            code += self._tree_code(tree, i, len(self._trees)) if not optimization else self._optimized_tree_code(tree, i, len(self._trees))
             code += "\n"
         return code
     
@@ -827,14 +895,15 @@ class XGBoost2GPU:
         
     def _kernel_code(self):
         # Generate the kernel code for the CUDA file
-        
-        code = "__global__ void xgboost_kernel(int* X, int* Y, float* prune, int prune_size,  int sample_size) {\n"
+
+        code = "__global__ void xgboost_kernel(int* X, int* Y, int* Y_expected, float* prune, int total_threads,  int sample_size) {\n"
 
         code += "    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
-        code += "    if (idx >= prune_size) return;\n\n"
+        code += "    if (idx >= total_threads) return;\n\n"
         code += f"   __shared__ int features[{len(self._min)}];\n" # Shared memory for features
         code += f"   int root[{len(self._trees)}];\n" # Root node for each tree
         code += f"   int sum_arr[{self._n_classes}];\n\n" # Sum[classes]
+        code += f"   int local_count = 0;\n"  # Local count for correct predictions
 
         nodes_offset = 0
         for tree_id, tree in enumerate(self._trees):
@@ -858,17 +927,23 @@ class XGBoost2GPU:
         code += "\n"  # Add a newline for better readability
 
         code +=  "   for (int i = 0; i < sample_size; i++) {\n"
-        for i in range(len(self._min)):
-            code += f"        features[{i}] = X[i * {len(self._min)} + {i}];\n" # Load features from input data
-        code += f"       quantize(features, {len(self._min)});\n" # 1. Quantization of features
+        code += "        if(threadIdx.x==0) {\n"
+        code += f"       for (int j = 0; j < {len(self._min)}; j++) {{\n"
+        code += f"            features[j] = X[i * {len(self._min)} + j];\n"
+        code += "        }\n"
+        code += "        }\n"
+        code += "        __syncthreads();\n"  # Synchronize threads
         code += "        int pred = 0;\n"
 
         code += f"      {self._forest_code()}"  # 2. Forest code generation
         for class_id in range(self._n_classes): # 3. Sum operation for each class
             code += f"        sum_arr[{class_id}] = sum(root, {class_id * (len(self._trees) // self._n_classes)}, {class_id * (len(self._trees) // self._n_classes) + (len(self._trees) // self._n_classes)}, {self._bias[class_id]});\n"
         code += f"        pred = argmax(sum_arr, {self._n_classes});\n" # 4. Argmax operation to get the predicted class
-        code += "        Y[idx * sample_size + i] = pred;\n"
+        code += f"        if(pred == Y_expected[i]) {{\n"  # 5. Check if the prediction is correct
+        code += "            local_count++;\n"  # Increment the count for correct predictions
+        code += "        }\n"
         code += "    }\n"
+        code += "    Y[idx] = local_count;\n"
         code += "}\n\n"
         return code
 
@@ -954,10 +1029,11 @@ File generated by XGBoost2GPU in {self._timestamp()}.
         code += "    // Initialize CUDA and allocate memory for input and output\n"
         code += "    int* X;\n"
         code += "    int* Y;\n"
-        code += "    float* prune;\n"
+        code += "    int* Y_expected;\n"
+        code += "    float* prune;\n\n"
 
         code += f"    int* X_host = (int*)malloc(sample_size * sizeof(int) * {len(self._min)}); // Host input data\n"
-        code += "    int* Y_host = (int*)malloc(sample_size * sizeof(int) * totalThreads); // Host output data\n"
+        code += "    int* Y_host = (int*)malloc(sizeof(int) * totalThreads); // Host output data\n"
         code += "    int* Y_expected_host = (int*)malloc(sample_size * sizeof(int)); // Host expected output data\n"
         code += "    float* prune_host = (float*)malloc(prune_size * sizeof(float)); // Host prune vector\n\n"
 
@@ -967,16 +1043,35 @@ File generated by XGBoost2GPU in {self._timestamp()}.
 
         code += "    // Allocate memory on the device\n"
         code += f"    cudaMalloc((void**)&X, sample_size * sizeof(int) * {len(self._min)});\n"
-        code += "    cudaMalloc((void**)&Y, sample_size * sizeof(int) * totalThreads);\n"
+        code += "    cudaMalloc((void**)&Y, totalThreads * sizeof(int));\n"
+        code += "    cudaMalloc((void**)&Y_expected, sample_size * sizeof(int));\n"
         code += "    cudaMalloc((void**)&prune, prune_size * sizeof(float));\n\n"
+
+
 
         code += "    // Copy data from host to device\n"
         code += f"    cudaMemcpy(X, X_host, sample_size * sizeof(int) * {len(self._min)}, cudaMemcpyHostToDevice);\n"
-        code += "    cudaMemcpy(Y, Y_host, sample_size * sizeof(int) * totalThreads, cudaMemcpyHostToDevice);\n"
+        code += "    cudaMemcpy(Y_expected, Y_expected_host, sample_size * sizeof(int), cudaMemcpyHostToDevice);\n"
         code += "    cudaMemcpy(prune, prune_host, prune_size * sizeof(float), cudaMemcpyHostToDevice);\n\n"
 
+        code += "    // Initialize output array on the device\n"
+        code += f"    cudaMemset(Y, 0, totalThreads * sizeof(int));\n\n"
+
         code += "    // Launch the kernel\n"
-        code += "    xgboost_kernel<<<optimalBlocks, threadsPerBlock>>>(X, Y, prune, prune_size, sample_size);\n"
+        code += "    // Get time\n"
+        code += "    cudaEvent_t start, stop;\n"
+        code += "    cudaEventCreate(&start);\n"
+        code += "    cudaEventCreate(&stop);\n"
+        code += "    cudaEventRecord(start);\n\n"
+        code += "    xgboost_kernel<<<optimalBlocks, threadsPerBlock>>>(X, Y, Y_expected, prune, totalThreads, sample_size);\n"
+        code += "    cudaEventRecord(stop);\n"
+        code += "    cudaEventSynchronize(stop);\n\n"
+
+        code += "    // Calculate elapsed time\n"
+        code += "    float milliseconds = 0;\n"
+        code += "    cudaEventElapsedTime(&milliseconds, start, stop);\n"
+        code += "    printf(\"Kernel execution time: %.2f ms\\n\", milliseconds);\n\n"
+
 
         code += "    // Check for errors\n"
         code += "    cudaError_t error = cudaGetLastError();\n"
@@ -986,50 +1081,14 @@ File generated by XGBoost2GPU in {self._timestamp()}.
         code += "    }\n\n"
 
         code += "    // Copy the output data back to the host\n"
-        code += "    cudaMemcpy(Y_host, Y, totalThreads * sample_size * sizeof(int), cudaMemcpyDeviceToHost);\n\n"
-
-        code += "    // Get acc\n"
-        code +="     int *correct = (int*)malloc(sizeof(int) * totalThreads);\n"
-        code +="     memset(correct, 0, sizeof(int) * totalThreads);\n"
-        code += "    for (int i = 0; i < totalThreads*sample_size; i++) {\n"
-        code += "        if (Y_host[i] == Y_expected_host[i % sample_size]) {\n"
-        code += "            correct[i / sample_size]++;\n"
-        code += "        }\n"
-        code += "    }\n"
+        code += "    cudaMemcpy(Y_host, Y, totalThreads * sizeof(int), cudaMemcpyDeviceToHost);\n\n"
 
 
-
-        code += "    // Print the base accuracy\n"
-        code += "    printf(\"Thread %d: %d/%d correct\\n\", 0, correct[0], sample_size);\n"
-        code += "    printf(\"Accuracy: %.2f%%\\n\", (float)correct[0] / sample_size * 100.0f);\n"
-
-        code += "    // Get 5 best accuracy\n";
         code += "    std::vector<std::pair<int, int>> thread_accuracy(totalThreads);\n";
         code += "    for (int i = 0; i < totalThreads; i++) {\n";
-        code += "        thread_accuracy[i] = std::make_pair(correct[i], i);\n";
+        code += "        thread_accuracy[i] = std::make_pair(Y_host[i], i);\n";
         code += "    }\n";
         code += "    std::sort(thread_accuracy.begin(), thread_accuracy.end(), std::greater<std::pair<int, int>>());\n";
-        code += "    printf(\"Top 5 accuracies:\\n\");\n";
-        code += "    for (int i = 0; i < 5 && i < totalThreads; i++) {\n";
-        code += "        int accuracy = thread_accuracy[i].first;\n";
-        code += "        int thread_id = thread_accuracy[i].second;\n";
-        code += "        printf(\"Thread %d: %d/%d correct (%.2f%%)\\n\", thread_id, accuracy, sample_size, (float)accuracy / sample_size * 100.0f);\n";
-        code += "    }\n\n";
-
-        # code += "    // Free device memory\n"
-        # code += "    cudaFree(X);\n"
-        # code += "    cudaFree(Y);\n"
-        # code += "    cudaFree(prune);\n\n"
-
-        # code += "    // Free host memory\n"
-        # code += "    free(X_host);\n"
-        # code += "    free(Y_host);\n"
-        # code += "    free(prune_host);\n\n"
-
-        # code += "    free(correct);\n"
-
-        # code += "    // Free expected output memory\n"
-        # code += "    free(Y_expected_host);\n\n"
 
         # Save the all accuracy results to a file
         code += "    FILE *file = fopen(\"accuracy_results.txt\", \"w\");\n"
@@ -1051,3 +1110,221 @@ File generated by XGBoost2GPU in {self._timestamp()}.
         code += "    return 0;\n}"
         return code
 
+
+    #====================#
+    # Optimized Code     #
+    # Gen Methods        #
+    #====================#
+
+    def _optimized_tree_code(self, tree: dict, id: int, number_trees: int) -> str:
+        """Generate CUDA code for a single tree using ternary operations (MUX).
+
+        Args:
+            tree (dict): The tree structure to generate code for.
+            id (int): The identifier for the tree.
+        Returns:
+            str: The generated CUDA code for the tree.
+        
+        Note:
+            I.e. of tree structure:
+            i.e.:{  0: {'type': 'split', 'feature': 32, 'threshold': 1, 'no': 2, 'yes': 1},
+                    1: {'type': 'split',
+                    'feature': 33,
+                    'threshold': 1,
+                    'no': 4,
+                    'yes': 3,
+                    'parent_node': 0,
+                    'parent_yesno': 'yes'},
+                    3: {'type': 'leaf', 'value': 0, 'parent_node': 1, 'parent_yesno': 'yes'},
+                    4: {'type': 'leaf', 'value': 1, 'parent_node': 1, 'parent_yesno': 'no'},
+                    2: {'type': 'split',
+                    'feature': 1,
+                    'threshold': 1,
+                    'no': 6,
+                    'yes': 5,
+                    'parent_node': 0,
+                    'parent_yesno': 'no'},
+                    5: {'type': 'leaf', 'value': 1, 'parent_node': 2, 'parent_yesno': 'yes'},
+                    6: {'type': 'leaf', 'value': 1, 'parent_node': 2, 'parent_yesno': 'no'}},
+
+        """
+        
+        self._get_mean(tree, 0)  # Calculate means for the tree
+        self._quantize_leafs(tree)
+        
+        # Calcula o offset baseado no id da árvore atual
+        nodes_offset = sum(self._model.nodes()[:id]) if id > 0 else 0
+        tree_id = id // self._n_classes      
+        class_id = id % self._n_classes      
+
+
+        root_index = class_id * (len(self._trees) // self._n_classes) + tree_id
+
+        code = ""
+        for node_id, node in reversed(tree.items()):  # Topological sort of the tree
+            global_id = node_id + nodes_offset
+
+            if node_id == 0:  # Save the result
+                # Root do not prune
+                code += f"      root[{root_index}] = (features[{node['feature']}] < {node['threshold']}) ? node_{node['yes'] + nodes_offset} : node_{node['no'] + nodes_offset};\n"
+            elif node['type'] == 'split':
+                code += f"      node_{global_id} = (prune[idx * prune_row_width + ({global_id} / 32)] & (1U << ({global_id} % 32))) ? {node['value']} : ((features[{node['feature']}] < {node['threshold']}) ? node_{node['yes'] + nodes_offset} : node_{node['no'] + nodes_offset})  ;\n"
+            elif node['type'] == 'leaf':
+                code += f"      node_{global_id} = {node['value']};\n"
+        
+        return code
+
+    def _optimized_kernel_code(self):
+        # Generate the kernel code for the CUDA file
+
+        code = "__global__ void xgboost_kernel(int* X, int* Y, int* Y_expected, const int* prune, int total_threads, int prune_row_width, int sample_size) {\n"
+
+        code += "    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n"
+        code += "    if (idx >= total_threads) return;\n\n"
+        code += f"   __shared__ int features[{len(self._min)}];\n" # Shared memory for features
+        code += f"   int root[{len(self._trees)}];\n" # Root node for each tree
+        code += f"   int sum_arr[{self._n_classes}];\n\n" # Sum[classes]
+        code += f"   int local_count = 0;\n\n"  # Local count for correct predictions
+
+        nodes_offset = 0
+        for tree_id, tree in enumerate(self._trees):
+            # Filtra apenas os nós que não são root (node_id != 0)
+            non_root_nodes = [nid for nid in tree.keys() if nid != 0]
+            
+            for i, node_id in enumerate(non_root_nodes):
+                node = tree[node_id]
+                global_id = node_id + nodes_offset
+                
+                if i == 0: # First node is the root node, so we don't need to declare it
+                    code += f"   int node_{global_id}"
+                elif i == len(non_root_nodes) - 1: # Last node is the leaf node, so we don't need to declare it
+                    code += f", node_{global_id};\n"  # Last node is a leaf, so we declare it
+                else: # Other nodes
+                    code += f", node_{global_id}"
+            
+            # Update offset using self._model.nodes()
+            nodes_offset += self._model.nodes()[tree_id]
+            
+        code += "\n"  # Add a newline for better readability
+
+        code +=  "   for (int i = 0; i < sample_size; i++) {\n"
+        code += "        if(threadIdx.x==0) {\n"
+        code += f"       for (int j = 0; j < {len(self._min)}; j++) {{\n"
+        code += f"            features[j] = X[i * {len(self._min)} + j];\n"
+        code += "        }\n"
+        code += "        }\n"
+        code += "        __syncthreads();\n"  # Synchronize threads
+        code += "        int pred = 0;\n"
+
+        code += f"      {self._forest_code(optimization=True)}"  # 2. Forest code generation
+        for class_id in range(self._n_classes): # 3. Sum operation for each class
+            code += f"        sum_arr[{class_id}] = sum(root, {class_id * (len(self._trees) // self._n_classes)}, {class_id * (len(self._trees) // self._n_classes) + (len(self._trees) // self._n_classes)}, {self._bias[class_id]});\n"
+        code += f"        pred = argmax(sum_arr, {self._n_classes});\n" # 4. Argmax operation to get the predicted class
+        code += f"        if(pred == Y_expected[i]) {{\n"  # 5. Check if the prediction is correct
+        code += "            local_count++;\n"  # Increment the count for correct predictions
+        code += "        }\n"
+        code += "    }\n"
+        code += "    Y[idx] = local_count;\n"
+        code += "}\n\n"
+        return code
+
+    def _optimized_main_code(self):
+        # Generate the main function code for the CUDA file
+
+        num_nodes = sum(self._model.nodes())
+        bits_per_int = 32  # Number of bits in an integer
+
+        code = "int main() {\n"
+
+        code += "    // Define the number of threads and blocks\n"
+        code += f"    const int threadsPerBlock = {self._n_threads};\n" # 2025-06-16 22:56:40 WARNING: This is a small number of threads per block, normal is 256
+        code += f"    const int optimalBlocks = {self._n_blocks};\n"
+        code += "    const int totalThreads = optimalBlocks * threadsPerBlock;\n\n"
+
+        code += "    // Define the size of the input data\n"
+        code += f"    const int sample_size = {self._n_samples}; // Number of samples\n"
+        
+
+        code += "    // Initialize CUDA and allocate memory for input and output\n"
+        code += "    int* X;\n"
+        code += "    int* Y;\n"
+        code += "    int* Y_expected;\n"
+        code += "    int* prune;\n\n"
+
+        code += f"    int* X_host = (int*)malloc(sample_size * sizeof(int) * {len(self._min)}); // Host input data\n"
+        code += "    int* Y_host = (int*)malloc(sizeof(int) * totalThreads); // Host output data\n"
+        code += "    int* Y_expected_host = (int*)malloc(sample_size * sizeof(int)); // Host expected output data\n"
+        code += f"    int* prune_host = (int*)malloc(totalThreads * {math.ceil(num_nodes / bits_per_int)} * sizeof(int)); // Host prune vector\n\n"
+
+        code += f"    read_vector_from_csv<int>(X_host, \"input.csv\", sample_size, {len(self._min)}); // Read input data from CSV\n"
+        code += f"    read_vector_from_csv<int>(Y_expected_host, \"expected_output.csv\", sample_size, 1); // Read expected output data from CSV\n"
+        code += f"    read_vector_from_csv<int>(prune_host, \"prune_matrix.csv\", totalThreads, {math.ceil(num_nodes / bits_per_int)}); // Read prune vector from CSV\n\n"
+
+        code += "    \n// Allocate memory on the device\n"
+        code += f"    cudaMalloc((void**)&X, sample_size * sizeof(int) * {len(self._min)});\n"
+        code += "    cudaMalloc((void**)&Y, totalThreads * sizeof(int));\n"
+        code += "    cudaMalloc((void**)&Y_expected, sample_size * sizeof(int));\n"
+        code += f"    cudaMalloc((void**)&prune, totalThreads * {math.ceil(num_nodes / bits_per_int)} * sizeof(int));\n\n"
+
+
+
+        code += "    // Copy data from host to device\n"
+        code += f"    cudaMemcpy(X, X_host, sample_size * sizeof(int) * {len(self._min)}, cudaMemcpyHostToDevice);\n"
+        code += "    cudaMemcpy(Y_expected, Y_expected_host, sample_size * sizeof(int), cudaMemcpyHostToDevice);\n"
+        code += f"    cudaMemcpy(prune, prune_host, totalThreads * {math.ceil(num_nodes / bits_per_int)} * sizeof(int), cudaMemcpyHostToDevice);\n\n"
+
+        code += "    // Initialize output array on the device\n"
+        code += f"    cudaMemset(Y, 0, totalThreads * sizeof(int));\n\n"
+
+        code += "    // Launch the kernel\n"
+        code += "    // Get time\n"
+        code += "    cudaEvent_t start, stop;\n"
+        code += "    cudaEventCreate(&start);\n"
+        code += "    cudaEventCreate(&stop);\n"
+        code += "    cudaEventRecord(start);\n\n"
+        code += f"    xgboost_kernel<<<optimalBlocks, threadsPerBlock>>>(X, Y, Y_expected, prune, totalThreads, {math.ceil(num_nodes / bits_per_int)}, sample_size);\n"
+        code += "    cudaEventRecord(stop);\n"
+        code += "    cudaEventSynchronize(stop);\n\n"
+
+        code += "    // Calculate elapsed time\n"
+        code += "    float milliseconds = 0;\n"
+        code += "    cudaEventElapsedTime(&milliseconds, start, stop);\n"
+        code += "    printf(\"Kernel execution time: %.2f ms\\n\", milliseconds);\n"
+
+        code += "    // Check for errors\n"
+        code += "    cudaError_t error = cudaGetLastError();\n"
+        code += "    if (error != cudaSuccess) {\n"
+        code += "        printf(\"CUDA error: %s\\n\", cudaGetErrorString(error));\n"
+        code += "        exit(EXIT_FAILURE);\n"
+        code += "    }\n\n"
+
+        code += "    // Copy the output data back to the host\n"
+        code += "    cudaMemcpy(Y_host, Y, totalThreads * sizeof(int), cudaMemcpyDeviceToHost);\n\n"
+
+
+
+        # code += "    // Get 5 best accuracy\n";
+        code += "    std::vector<std::pair<int, int>> thread_accuracy(totalThreads);\n";
+        code += "    for (int i = 0; i < totalThreads; i++) {\n";
+        code += "        thread_accuracy[i] = std::make_pair(Y_host[i], i);\n";
+        code += "    }\n";
+        code += "    std::sort(thread_accuracy.begin(), thread_accuracy.end(), std::greater<std::pair<int, int>>());\n";
+
+        code += "    FILE *file = fopen(\"accuracy_results.txt\", \"w\");\n"
+        code += "    if (file == NULL) {\n"
+        code += "        printf(\"Error opening file for writing accuracy results\\n\");\n"
+        code += "        exit(EXIT_FAILURE);\n"
+        code += "    }\n"
+
+        code += "    fprintf(file, \"id acc\\n\");\n"
+        code += "    for (int i = 0; i < totalThreads; i++) {\n"
+        code += "        int accuracy = thread_accuracy[i].first;\n"
+        code += "        int thread_id = thread_accuracy[i].second;\n"
+        code += "        fprintf(file, \"%d %.2f\\n\", thread_id, (float)accuracy / sample_size * 100.0f);\n"
+        code += "    }\n"
+        code += "    fclose(file);\n"
+
+        code += "    // Reset the device\n"
+        code += "    cudaDeviceReset();\n"
+        code += "    return 0;\n}"
+        return code
