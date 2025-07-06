@@ -158,23 +158,6 @@ XGBoost2GPU supports multiple pruning strategies to optimize model performance:
 | `n_threads` | int | 1024 | CUDA threads per block |
 | `n_blocks` | int | 768 | Number of CUDA blocks |
 
-## Performance
-
->  **Performance**: XGBoost2GPU can achieve significant speedups over CPU inference.
-
-### Benchmark Results
-
-| Dataset | Model Size | CPU Time | GPU Time | Speedup |
-|---------|------------|----------|----------|---------|
-| SUSY | 7 trees, depth 7 | 2.3ms | 0.08ms | **28.7x** |
-| Covtype | 10 trees, depth 5 | 1.8ms | 0.05ms | **36.0x** |
-| Custom | 5 trees, depth 4 | 1.2ms | 0.04ms | **30.0x** |
-
-### Memory Usage
-
-- **Quantized models**: 60-80% memory reduction
-- **Pruned models**: Additional 10-30% reduction
-- **GPU memory**: Efficient utilization with shared memory
 
 ##  Development
 
