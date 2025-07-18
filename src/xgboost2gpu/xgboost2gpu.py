@@ -154,6 +154,7 @@ class XGBoost2GPU:
                 # Calculate probability for current node
                 if self._debug:
                     print(f"Calculating cut probability for node {node_id} at level {node_levels[node_id]} in tree {tree_index} with global ID {node['global_id']}")
+
                 prob = self._calculate_cut_probability(
                     node_level=node_levels[node_id],
                     nodes_cut_so_far=nodes_cut_so_far,
@@ -178,8 +179,8 @@ class XGBoost2GPU:
                 decision = self._simulate_cut_decision(pruner, prob, global_id)
                 if decision:
                     # Node should be cut
-                    nodes_cut_so_far += self._consequence_nodes(node_levels[node_id])
-                    nodes_cut_in_tree += self._consequence_nodes(node_levels[node_id])
+                    nodes_cut_so_far +=  self._consequence_nodes(tree, node_id)
+                    nodes_cut_in_tree += self._consequence_nodes(tree, node_id)
             
                 nodes_processed_so_far += 1  # Update processed nodes
 
@@ -680,32 +681,57 @@ class XGBoost2GPU:
         # print(f"Info: Thresholds for quantization module: {thresholds}")
         return thresholds
    
-    def _consequence_nodes(self, level: int) -> int:
-        """Calculate the number of nodes that will be pruned as consequence
-        of pruning a node at a given level in the tree.
-
-
-        0 -> root node, no nodes will be pruned
-        1 -> level 1, 2 nodes will be pruned
-        2 -> level 2, 4 nodes will be pruned
-        .
-        .
-        max_level -> 2**max_level nodes will be pruned
-        
-        Args:
-            level (int): The level of the node in the tree.
-        
-        Returns:
-            int: The number of nodes that will be pruned.
+    def _consequence_nodes(self, tree: dict, node: int) -> int:
         """
-        
-        if level < 0:
-            raise ValueError("Level must be a non-negative integer.")
-        if level == 0:
-            return 0  # Root node, no nodes will be pruned
-        return 2 ** (self._model.max_depth - level) + 1 # Each level doubles the number of nodes in a binary tree
+        Calculates the number of descendant nodes that would be removed as a
+        consequence of pruning a specific decision node.
 
-   
+        Args:
+            tree (dict): The tree data structure, where keys are node IDs.
+            node (int): The ID of the decision node to be pruned.
+
+        Returns:
+            int: The number of nodes that would be pruned as a consequence.
+        """
+        # Nodes that will be removed as a consequence
+        consequence_nodes = set()
+        
+        # Check if the node to be cut exists and is a decision node ('split')
+        node_data = tree.get(node)
+        if not node_data or node_data.get('type') != 'split':
+            # If it's a leaf or doesn't exist, no other nodes are affected
+            return 0
+
+        # Initialize a queue for Breadth-First Search (BFS) starting from the node's children
+        queue = []
+        left_child = node_data.get('no')
+        right_child = node_data.get('yes')
+
+        if left_child is not None:
+            queue.append(left_child)
+        if right_child is not None:
+            queue.append(right_child)
+        
+        # Perform the traversal to find all descendants
+        while queue:
+            current_node_id = queue.pop(0)
+            if current_node_id not in consequence_nodes:                
+                consequence_nodes.add(current_node_id)
+                
+                current_node_data = tree.get(current_node_id)
+                
+                # If the descendant is also a decision node, add its children to the queue
+                if current_node_data and current_node_data.get('type') == 'split':
+                    grand_left_child = current_node_data.get('no')
+                    grand_right_child = current_node_data.get('yes')
+                    
+                    if grand_left_child is not None:
+                        queue.append(grand_left_child)
+                    if grand_right_child is not None:
+                        queue.append(grand_right_child)
+
+        # Return the total count of nodes in the subtree
+        return len(consequence_nodes)
     #====================#
     # Code Gen Methods   #
     #====================#
