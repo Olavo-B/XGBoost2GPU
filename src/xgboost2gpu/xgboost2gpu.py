@@ -130,16 +130,22 @@ class XGBoost2GPU:
         nodes_cut_so_far = 0
         nodes_processed_so_far = 0
 
-        probabilities = {}
-        
+        probabilities = [0 for i in range(sum(self._model.nodes()))]
+
         # Initialize hash function for consistent decisions
         pruner = TreePruningHash()
 
+        # 2025-07-18 09:28:08
+        # Start from the last tree, that has the less importance
+        # zip(range(len(self._trees),-1, -1), reversed(self._trees))
         for tree_index, tree in enumerate(self._trees):
             nodes_in_tree = len(tree)
             nodes_cut_in_tree = 0
             node_levels = self._get_node_levels(tree)
-            for node_id , node in tree.items():
+            max_level   = max(node_levels.values())
+            # 2025-07-18 09:29:43
+            # Start with the last node in a DFS structure 
+            for node_id , node in reversed(tree.items()):
 
                 # 2025-06-17 17:22:13
                 # If node is a leaf, the probability is 1.0 (no cut)
@@ -151,6 +157,7 @@ class XGBoost2GPU:
                 if node_id == 0:
                     probabilities[node['global_id']] = 0.0
                     continue
+
                 # Calculate probability for current node
                 if self._debug:
                     print(f"Calculating cut probability for node {node_id} at level {node_levels[node_id]} in tree {tree_index} with global ID {node['global_id']}")
@@ -168,7 +175,9 @@ class XGBoost2GPU:
                     strategy=strategy,
                     level_importance=level_importance,
                     progress_importance=progress_importance,
-                    level_bias=level_bias
+                    level_bias=level_bias,
+                    max_level=max_level
+                    
                 )
 
                 global_id = node['global_id']
@@ -186,10 +195,10 @@ class XGBoost2GPU:
 
         # Save probabilities in a .csv file
         with open(output_file, 'w') as f:
-            for node_id, prob in probabilities.items():
+            for node_id, prob in enumerate(probabilities):
                 f.write(f"{prob}\n")
 
-        self._prune = np.array(list(probabilities.values()))  # Store probabilities for later use
+        self._prune = np.array(probabilities)  # Store probabilities for later use
 
     def should_cut_node(self, thread_id: int, node_id: int) -> int:
         """Determine if a node should be cut based on its ID and a cut probability.
@@ -522,7 +531,8 @@ class XGBoost2GPU:
                                    nodes_processed_so_far, total_nodes_in_forest,
                                    nodes_cut_in_tree, nodes_in_tree, max_cut_percentage,
                                    urgency_override_threshold, strategy,
-                                   level_importance, progress_importance, level_bias):
+                                   level_importance, progress_importance, level_bias,
+                                   max_level):
         """
         Calculate cut probability based on tree parameters
         
@@ -544,6 +554,7 @@ class XGBoost2GPU:
             level_importance: controls level impact (0.0 to 1.0+)
             progress_importance: controls progress impact (0.0 to 1.0+)  
             level_bias: base multiplier to give more weight to level (1.0+)
+            max_level: maximum level of the tree
 
         Returns:
             probability between 0.0 and 1.0, beeing 1.0 the node will be cut and 0.0 the node will not be cut.
@@ -557,11 +568,6 @@ class XGBoost2GPU:
 
         urgency_ratio = remaining_to_cut / remaining_to_process
 
-        if remaining_to_process > 0:
-            is_desperate = urgency_ratio > ((total_nodes_to_cut / total_nodes_in_forest) * urgency_override_threshold)
-            if is_tree_limit_reached and not is_desperate:
-                return 0.0 # Respect the limit, as we are not desperate
-
         if self._debug:
             print(f"  Status:")
             print(f"    · Nodes cut so far: {nodes_cut_so_far}")
@@ -569,10 +575,15 @@ class XGBoost2GPU:
             print(f"    · Nodes processed so far: {nodes_processed_so_far}")
             print(f"    · Total nodes in forest: {total_nodes_in_forest}")
             print(f"    · Nodes cut in current tree: {nodes_cut_in_tree}")
+            print(f"    · Max nodes to cut in tree: {max_nodes_in_tree}")
+            print(f"    · Is tree limit reached: {is_tree_limit_reached}")
             print(f"    · Remaining to process: {remaining_to_process}")
             print(f"    · Remaining to cut: {remaining_to_cut}")
-            print(f"    · Max nodes in tree: {max_nodes_in_tree}")
-            print(f"    · Is tree limit reached: {is_tree_limit_reached}")
+
+        if remaining_to_process > 0:
+            is_desperate = urgency_ratio > ((total_nodes_to_cut / total_nodes_in_forest) * urgency_override_threshold)
+            if is_tree_limit_reached and not is_desperate:
+                return 0.0 # Respect the limit, as we are not desperate
 
         if remaining_to_cut <= 0:
             return 0.0 # Goal reached
@@ -594,7 +605,17 @@ class XGBoost2GPU:
             progress_ratio = nodes_cut_so_far / total_nodes_to_cut if total_nodes_to_cut > 0 else 0
             urgency_factor = (1.0 + (0.5 - progress_ratio)) * (1.0 + progress_importance)
             urgency_factor = max(0.1, urgency_factor)
+        elif strategy == "flat": # Cut just nodes below a level
+            if self._debug:
+                print(f"    · Node Level: {node_level}")
+                print(f"    · Max Level: {max_level}")
+                print(f"    · Node Zone: {node_level / max_level}")
 
+            node_zone = node_level / max_level # Just cut the 50%ths deepest nodes
+            level_factor = level_bias + (node_level * level_importance) if node_zone >= 0.5 else 0
+            progress_ratio = nodes_cut_so_far / total_nodes_to_cut if total_nodes_to_cut > 0 else 0
+            urgency_factor = (1.0 + (0.5 - progress_ratio)) * (1.0 + progress_importance)
+            urgency_factor = max(0.1, urgency_factor)
         elif strategy == "random":
             return random.uniform(0.0, 1.0)  # Random probability for testing
         
@@ -603,6 +624,8 @@ class XGBoost2GPU:
             print(f"    » Level Factor: {level_factor:.4f}")
             print(f"    » Urgency Factor: {urgency_factor:.4f}")
             print(f"    » Base Probability: {base_prob:.4f}")
+            print(f"    » Final Probability: {base_prob * level_factor * urgency_factor:.4f}")
+            
             
 
         final_prob = base_prob * level_factor * urgency_factor
@@ -732,6 +755,7 @@ class XGBoost2GPU:
 
         # Return the total count of nodes in the subtree
         return len(consequence_nodes)
+    
     #====================#
     # Code Gen Methods   #
     #====================#
