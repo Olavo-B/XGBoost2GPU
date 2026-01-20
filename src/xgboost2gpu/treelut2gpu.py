@@ -47,6 +47,7 @@ class XGBoost2GPU:
         self._prune             = None  # Placeholder for prune vector, to be set later
         self._trees_array       = None  # Placeholder for the trees converted to NumPy arrays
         self._tree_root_indices = None  # Placeholder for root indices of trees
+        self._percentage_to_cut   = 0.0 # Percentage of nodes to cut in the forest
 
 
 
@@ -120,11 +121,17 @@ class XGBoost2GPU:
         """
         total_nodes_in_forest = sum(self._model.nodes())
         total_nodes_to_cut = int(total_nodes_in_forest * percentage_to_cut)
+        self._percentage_to_cut = percentage_to_cut
 
         # 2025-07-01 13:42:58
         # Remove leafs and roots from the total nodes to cut
         total_nodes_in_forest -= sum(1 for tree in self._trees for node in tree.values() if node['type'] == 'leaf')
         total_nodes_in_forest -= sum(1 for tree in self._trees for node in tree.keys() if node == 0)  # Remove roots
+
+        if self._debug:
+            print(f"Calculating cut probabilities for the forest:")
+            print(f"  » Total nodes in forest (excluding leafs and roots): {total_nodes_in_forest}")
+            print(f"  » Total nodes to cut: {total_nodes_to_cut}")
 
 
         nodes_cut_so_far = 0
@@ -233,10 +240,102 @@ class XGBoost2GPU:
         GID_IDX = 5
 
         cut_probabilities = self._prune
+        # corrected_cut_probabilities = self.generate_calibrated_vector_for_thread(thread_id, 
+        #                                                                          self._percentage_to_cut, 
+        #                                                                          cut_probabilities)
         global_ids = self._trees_array[:, GID_IDX].astype(np.int32)
         pruner = TreePruningHash()
 
         return pruner.should_cut_nodes_vectorized(thread_id, cut_probabilities, global_ids)
+    
+    def generate_calibrated_vector_for_thread(self, thread_id: int, target_percentage: float, 
+                                            base_probs: list, error_margin: float = 0.05) -> list:
+        """
+        Generates a probability vector specifically adjusted for a thread_id,
+        ensuring that the final cut percentage (including consequences) 
+        falls within the requested error margin.
+        """
+
+        if self._debug:
+            print(f"Thread {thread_id}: Generating calibrated vector for target percentage {target_percentage}")
+        
+        # 1. Preparation
+        total_nodes = sum(self._model.nodes())
+        target_nodes_count = int(total_nodes * target_percentage)
+        
+        # Acceptable limits
+        min_acceptable = int(target_nodes_count * (1.0 - error_margin))
+        max_acceptable = int(target_nodes_count * (1.0 + error_margin))
+        
+        # 2. Binary Search to find the Scaling Factor (S)
+        low_scaler = 0.0
+        high_scaler = 100.0 # High enough to saturate everything at 1.0 if needed
+        best_scaler = 1.0
+        best_diff = float('inf')
+        
+        # Instantiate Hash
+        pruner = TreePruningHash()
+        
+        # Pre-calculated Hash Array for this thread (Critical Performance)
+        # Calculate the hash for all nodes for this thread once
+        node_ids = np.arange(total_nodes, dtype=np.int32)
+        
+        # Note: simulating deterministic hash here
+        # We need to expose _generate_hash_value_vectorized or use internal logic:
+        raw_hashes = pruner._generate_hash_value_vectorized(thread_id, node_ids)
+        
+        # Normalize hashes to 0.0 - 1.0
+        normalized_hashes = (raw_hashes & 0x7FFFFFFF) / 2147483647.0
+        
+        iteration = 0
+        max_iterations = 20 # 20 iterations are enough for high precision
+        
+        while iteration < max_iterations:
+            current_scaler = (low_scaler + high_scaler) / 2.0
+            
+            # 3. Cut Simulation with Current Scaler
+            
+            # Apply Probability * Scaler
+            test_probs = np.array(base_probs) * current_scaler
+            
+            # --- CONSEQUENCE COUNTING ---
+            # Iterate through the real structure to sum correctly without double counting
+            count_accum = 0
+            
+            # Iterate over tree roots
+            for tree in self._trees:
+                # Helper method to count actual cuts
+                cuts_in_tree = self._simulate_tree_traversal(tree, normalized_hashes, test_probs)
+                count_accum += cuts_in_tree
+
+            # 4. Evaluation
+            if count_accum < min_acceptable:
+                # Cut too little, need to increase probabilities
+                low_scaler = current_scaler
+            elif count_accum > max_acceptable:
+                # Cut too much, need to decrease probabilities
+                high_scaler = current_scaler
+            else:
+                # Success! Within margin
+                best_scaler = current_scaler
+                break
+            
+            # Keep the best so far in case it doesn't converge perfectly
+            if abs(count_accum - target_nodes_count) < best_diff:
+                best_diff = abs(count_accum - target_nodes_count)
+                best_scaler = current_scaler
+                
+            iteration += 1
+
+        # 5. Generate final vector
+        final_probs = np.array(base_probs) * best_scaler
+        final_probs = np.clip(final_probs, 0.0, 1.0) # Ensure it doesn't exceed 1.0
+
+        if self._debug:
+            if final_probs.all() == base_probs.all():
+                print(f"Thread {thread_id}: Adjusted probabilities with scaler {best_scaler:.4f} after {iteration} iterations.")
+        
+        return final_probs
 
     def prune_matrix(self, num_threads: int = None, save_matrix: bool = False) -> np.ndarray:
         """
@@ -334,6 +433,10 @@ class XGBoost2GPU:
         # prune_flags = np.zeros(len(global_ids), dtype=bool)  # All False for testing
         # Uncomment this line when ready to use actual pruning:
         prune_flags = self.should_cut_nodes(thread_id).astype(bool)
+
+        if self._debug:
+            print(f"Starting prediction for {n_samples} samples using thread ID {thread_id}.")
+            print(prune_flags)
 
         # The main prediction loop iterates over each tree in the ensemble.
         for i, root_node_idx in enumerate(self._tree_root_indices):
@@ -618,6 +721,7 @@ class XGBoost2GPU:
             urgency_factor = max(0.1, urgency_factor)
         elif strategy == "random":
             return random.uniform(0.0, 1.0)  # Random probability for testing
+            
         
 
         if self._debug:
@@ -756,6 +860,52 @@ class XGBoost2GPU:
         # Return the total count of nodes in the subtree
         return len(consequence_nodes)
     
+    def _simulate_tree_traversal(self, tree, normalized_hashes, test_probs):
+        """
+        Simulates traversal to count how many nodes are removed (cut node + children).
+        If a node is cut, all its children count towards the sum, but their hashes are not tested.
+        """
+        count = 0
+        
+        # Stack for DFS: (node_id, is_ancestor_cut)
+        # Assumes node 0 of local tree is root
+        root_id = 0 # Adjust according to how your data structure identifies the local root
+        stack = [(root_id, False)] 
+        
+        while stack:
+            local_id, parent_cut = stack.pop()
+            node = tree[local_id]
+            global_id = node['global_id']
+            
+            is_cut = False
+            
+            if parent_cut:
+                # If parent was already cut, this node is counted as consequence
+                # Continue descending marking everything as cut
+                count += 1
+                is_cut = True
+            else:
+                # Parent not cut, test this node
+                # If leaf, probability is usually 0, but we test anyway
+                prob = test_probs[global_id]
+                hash_val = normalized_hashes[global_id]
+                
+                if hash_val < prob:
+                    # CUT!
+                    count += 1 
+                    is_cut = True
+                    # From here on, all children will be "consequence"
+                else:
+                    is_cut = False
+            
+            # Add children to stack
+            if 'left' in node:
+                stack.append((node['left'], is_cut))
+            if 'right' in node:
+                stack.append((node['right'], is_cut))
+                
+        return count
+
     #====================#
     # Code Gen Methods   #
     #====================#
@@ -1218,6 +1368,11 @@ File generated by XGBoost2GPU in {self._timestamp()}.
                 # Root do not prune
                 code += f"      root[{root_index}] = (features[{node['feature']}] < {node['threshold']}) ? node_{node['yes'] + nodes_offset} : node_{node['no'] + nodes_offset};\n"
             elif node['type'] == 'split':
+                # Using bitwise operations for pruning
+                # The index in the prune array is calculated as global_id / 32
+                # The bit position is global_id % 32
+                # e.g.
+
                 code += f"      node_{global_id} = (prune[idx * prune_row_width + ({global_id} / 32)] & (1U << ({global_id} % 32))) ? {node['value']} : ((features[{node['feature']}] < {node['threshold']}) ? node_{node['yes'] + nodes_offset} : node_{node['no'] + nodes_offset})  ;\n"
             elif node['type'] == 'leaf':
                 code += f"      node_{global_id} = {node['value']};\n"

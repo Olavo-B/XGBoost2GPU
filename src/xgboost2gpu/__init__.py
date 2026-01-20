@@ -26,7 +26,7 @@ except ImportError as e:
     warnings.warn(f"TreePruningHash not available: {e}")
 
 try:
-    from .xgboost2gpu import XGBoost2GPU
+    from .treelut2gpu import XGBoost2GPU
     _XGBOOST2GPU_AVAILABLE = True
 except ImportError as e:
     XGBoost2GPU = None
